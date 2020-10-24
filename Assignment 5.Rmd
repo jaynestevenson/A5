@@ -1,19 +1,226 @@
 ---
 title: "Assignment 5"
-output: html_notebook
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    df_print: paged
+editor_options:
+  chunk_output_type: console
 ---
 
-This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
 
-Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Cmd+Shift+Enter*. 
-
-```{r}
-plot(cars)
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = F, message = F)
 ```
 
-Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Cmd+Option+I*.
+```{r}
+library(lehdr)
+library(tidyverse)
+library(tigris)
+library(sf)
+library(leaflet)
+library(censusapi)
+library(mapboxapi)
 
-When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Cmd+Shift+K* to preview the HTML file). 
+Sys.setenv(CENSUS_KEY="c8aa67e4086b4b5ce3a8717f59faa9a28f611dab")
+```
 
-The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
+```{r}
+ballot_drop_off_locations <- read_csv("SFBI Database.csv") %>% 
+  rename(latitude = "latitude (from locations) 2", longitude = "longitude (from locations) 2") %>%
+  select(c(Name, latitude, longitude, taxonomy, service_area)) %>%
+  filter(taxonomy == "Ballot Drop Off") %>%
+  mutate(
+    latitude = as.numeric(latitude),
+    longitude = as.numeric(longitude)
+  ) %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326)
+  
+```
 
+```{r}
+leaflet() %>% 
+  addProviderTiles(providers$CartoDB.Positron) %>% 
+  addCircleMarkers(
+    data = ballot_drop_off_locations,
+    radius = 1,
+    label = ~Name
+  )
+```
+
+
+```{r}
+drive_10_min <- mb_isochrone(
+  ballot_drop_off_locations,
+  profile = "driving",
+  time = 10
+)
+
+ballot_drop_off_drive_10min <- 
+  ballot_drop_off_locations %>%
+  st_set_geometry(NULL) %>%
+  cbind(drive_10_min$geometry) %>%
+  st_as_sf()
+```
+
+
+```{r}
+leaflet() %>% 
+  addMapboxTiles(
+    style_id = "streets-v11",
+    username = "mapbox"
+  ) %>%
+  addPolygons(
+    data = ballot_drop_off_drive_10min,
+    label = ~Name
+  )
+```
+
+```{r}
+bay_county_names <-
+  c(
+    "Alameda",
+    "Contra Costa",
+    "Marin",
+    "Napa",
+    "San Francisco",
+    "San Mateo",
+    "Santa Clara",
+    "Solano",
+    "Sonoma"
+  )
+
+bay_counties <-
+  counties("CA", cb = T, progress_bar = F) %>%
+  filter(NAME %in% bay_county_names) 
+
+ca_bg <- block_groups("CA", cb = T, progress_bar = F) 
+
+options(tigris_use_cache=F) 
+
+options(tigris_use_cache=T)
+
+```
+
+
+```{r}
+bay_area_bg <-
+  ca_bg %>%
+  st_centroid() %>%
+  .[bay_counties, ] %>%
+  st_set_geometry(NULL) %>%
+  left_join(ca_bg %>% select(GEOID)) %>%
+  st_as_sf() %>%
+  st_transform(26910) %>% 
+  mutate(original_area = st_area(.))
+```
+
+```{r}
+bay_area_bg_isochrone_intersect <-
+  bay_area_bg %>% 
+  st_intersection(
+    ballot_drop_off_drive_10min %>% 
+      st_union() %>% 
+      st_transform(26910)
+  ) %>% 
+  mutate(
+    leftover_area = st_area(.),
+    perc_area = leftover_area / original_area
+  ) 
+
+```
+
+```{r}
+ca_rac <- grab_lodes(
+  state = "ca", 
+  year = 2017, 
+  lodes_type = "rac", 
+  job_type = "JT01",
+  state_part = "main", 
+  agg_geo = "bg"
+)
+saveRDS(ca_rac, "ca_rac.rds")
+```
+
+```{r}
+ca_rac <-
+  readRDS("ca_rac.rds")
+```
+
+```{r}
+bay_area_rac <-
+  ca_rac %>%
+  filter(h_bg %in% bay_area_bg$GEOID) %>%
+  select(c("h_bg", "C000", "CE01", "CE02", "CE03")) %>%
+  group_by(h_bg) %>%
+  summarize(
+    total_jobs = sum(C000),
+    jobs_1250_or_less = sum(CE01),
+    jobs_1251_to_3333 = sum(CE02),
+    jobs_greater_than_3333 = sum(CE03)
+  ) 
+
+
+bay_area_rac_iso <-
+  bay_area_rac %>%
+  right_join(bay_area_bg_isochrone_intersect, by = c("h_bg" = "GEOID")) %>%
+  mutate(
+    total_coverage = total_jobs * perc_area,
+    coverage_1250 = jobs_1250_or_less * perc_area,
+    coverage_1251_to_3333 = jobs_1251_to_3333 * perc_area,
+    coverage_3333 = jobs_greater_than_3333 * perc_area
+  )
+  
+bay_total_coverage <- sum(bay_area_rac_iso$total_coverage, na.rm = TRUE) / sum(bay_area_rac$total_jobs, na.rm = TRUE) 
+
+print(bay_total_coverage) #~85% of total bay area workers live within a 10-minute drive of a ballot drop off location.
+
+bay_lowest_income <- sum(bay_area_rac_iso$coverage_1250, na.rm = TRUE)/sum(bay_area_rac$jobs_1250_or_less, na.rm = TRUE)
+
+print(bay_lowest_income) #85% of bay area workers earning $1250 a month or less live within a 10-minute drive of a ballot drop off location.
+
+bay_middle_income <- sum(bay_area_rac_iso$coverage_1251_to_3333, na.rm = TRUE)/sum(bay_area_rac$jobs_1251_to_3333, na.rm = TRUE)
+
+print(bay_middle_income) #86% of bay area workers earning $1251-3333 a month live within a 10-minute drive of a ballot drop off location.
+
+bay_highest_income <- sum(bay_area_rac_iso$coverage_3333, na.rm = TRUE) / sum(bay_area_rac$jobs_greater_than_3333, na.rm = TRUE)
+
+print(bay_highest_income) #84% of bay area workers earning greater than $3333 a month live within a 10-minute drive of a ballot drop off location. 
+
+```
+This analysis suggests that access to ballot drop off locations (within a 10-minute drive of residence) is essentially the same among workers with different wages. Overall, ~85% of bay area workers live within a 10-minute drive of a ballot drop off location. This percentage is nearly the same for the different wage groups, ranging from 84% coverage to 86% coverage. It appears that the highest wage group, those earning greater than $3333 a month, actually have the lowest percent access, but this is only a 1% and 2% difference from the other wage groups and thus overall access appears equitable for all bay area workers. A major assumption in this analysis is that all workers have access to transportation that allows them to reach a drop off location within a 10-minute drive of their residence. This assumption may be false, especially for workers with the lowest wages, but based on my personal experiences with ballot drop off locations, I felt that driving isochrones allowed for a more realistic representation of the service. This is a current limitation in the analysis, however further study could examine differences in access using walking isochrones. 
+
+
+```{r}
+perc_jobs_1250_or_less <- sum(bay_area_rac$jobs_1250_or_less, na.rm = TRUE)/ sum(bay_area_rac$total_jobs, na.rm = TRUE)
+
+print(perc_jobs_1250_or_less) #12.5% of bay area workers earn $1250 or less a month.
+
+perc_jobs_1251_to_3333 <- sum(bay_area_rac$jobs_1251_to_3333, na.rm = TRUE) / sum(bay_area_rac$total_jobs, na.rm = TRUE)
+
+print(perc_jobs_1251_to_3333) #23.5% of bay area workers earn $1251-3333 a month.
+
+perc_jobs_greater_3333 <- sum(bay_area_rac$jobs_greater_than_3333, na.rm = TRUE) / sum(bay_area_rac$total_jobs, na.rm = TRUE)
+
+print(perc_jobs_greater_3333) #64% of bay area workers earn greater than $3333 a month.
+
+```
+
+```{r}
+perc_coverage_1250_or_less <- sum(bay_area_rac_iso$coverage_1250, na.rm = TRUE) / sum(bay_area_rac_iso$total_coverage, na.rm = TRUE) 
+
+print(perc_coverage_1250_or_less) #12.5% of residents covered by the service earn $1250 or less a month.
+
+perc_coverage_1251_to_3333 <- sum(bay_area_rac_iso$coverage_1251_to_3333, na.rm = TRUE) / sum(bay_area_rac_iso$total_coverage, na.rm = TRUE) 
+
+print(perc_coverage_1251_to_3333) #24% of residents covered by the service earn $1251-3333 a month.
+
+perc_coverage_greater_than_3333 <- sum(bay_area_rac_iso$coverage_3333, na.rm = TRUE) / sum(bay_area_rac_iso$total_coverage, na.rm = TRUE) 
+
+print(perc_coverage_greater_than_3333) #63.5% of residents covered by the service earn greater than $3333 a month. 
+```
+This final part of the analysis is another way of showing that access to the service is equitable across wage groups. This is evident because the percent of residents in each wage group aligns with the percent of people covered who are in that same wage group.
+
+
+
+Data on ballot drop off locations came from BayAreaCommunity.org and unboxproject.org. 
